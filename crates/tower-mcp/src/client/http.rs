@@ -1107,7 +1107,6 @@ fn is_jsonrpc_error_response(value: &serde_json::Value) -> bool {
 
 struct HttpRequestSendError {
     message: String,
-    connection_failed: bool,
 }
 
 impl HttpRequestSendError {
@@ -1123,17 +1122,13 @@ impl HttpRequestSendError {
             message.push_str(&format!(": {err}"));
             source = err.source();
         }
-        Self {
-            message,
-            connection_failed: true,
-        }
+        Self { message }
     }
 
     #[cfg(feature = "oauth-client")]
     fn oauth(error: OAuthClientError) -> Self {
         Self {
             message: error.to_string(),
-            connection_failed: false,
         }
     }
 }
@@ -1571,14 +1566,15 @@ impl ClientTransport for HttpClientTransport {
                 let response = match response_result {
                     Ok(r) => r,
                     Err(e) => {
-                        let connection_failed = e.connection_failed;
                         tracing::error!(error = %e.message, "Background HTTP request failed");
                         if let Some(id) = &reply_id {
                             let _ = tx.send(transport_error_frame(id, &e.message)).await;
                         }
-                        if connection_failed {
-                            connected.store(false, Ordering::Release);
-                        }
+                        // Do NOT flip connected=false here. The error is
+                        // already delivered to the caller as a -32000 frame;
+                        // leaving connected=true lets the retry layer
+                        // re-dispatch the request.  reqwest's connection pool
+                        // handles reconnection transparently for HTTP.
                         return;
                     }
                 };
@@ -1637,7 +1633,11 @@ impl ClientTransport for HttpClientTransport {
                     if let Some(id) = &reply_id {
                         let _ = tx.send(transport_error_frame(id, &status_error)).await;
                     }
-                    connected.store(false, Ordering::Release);
+                    // Do NOT flip connected=false for transient HTTP errors.
+                    // The error is already delivered as a -32000 frame; leaving
+                    // connected=true lets the retry layer re-dispatch the request.
+                    // reqwest's connection pool handles reconnection transparently for HTTP.
+                    // Only flip connected=false for non-recoverable errors (see below).
                     return;
                 }
 
@@ -1908,7 +1908,8 @@ impl ClientTransport for HttpClientTransport {
                                     ))
                                     .await;
                             }
-                            connected.store(false, Ordering::Release);
+                            // Do NOT flip connected=false for transient body read errors.
+                            // The error is delivered as -32000; retry layer can re-dispatch.
                         }
                     }
                 }
