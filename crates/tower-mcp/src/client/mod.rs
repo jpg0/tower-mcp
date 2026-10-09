@@ -2792,8 +2792,29 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
 
                         if let Err(e) = transport.send(&json).await {
                             tracing::error!(error = %e, "Transport send error");
-                            fail_all_pending(&mut pending_requests, &format!("Transport error: {}", e));
-                            break;
+                            // Attempt reconnection before failing pending requests
+                            match transport.reconnect().await {
+                                Ok(true) => {
+                                    tracing::info!("Reconnection succeeded, retrying request");
+                                    // Retry the send
+                                    if let Err(e) = transport.send(&json).await {
+                                        tracing::error!(error = %e, "Transport send error after reconnect");
+                                        fail_all_pending(&mut pending_requests, &format!("Transport error after reconnect: {}", e));
+                                        break;
+                                    }
+                                    // Send succeeded after reconnect, continue
+                                }
+                                Ok(false) => {
+                                    tracing::warn!("Reconnection not supported or not attempted");
+                                    fail_all_pending(&mut pending_requests, &format!("Transport error: {}", e));
+                                    break;
+                                }
+                                Err(reconnect_err) => {
+                                    tracing::error!(error = %reconnect_err, "Reconnection failed");
+                                    fail_all_pending(&mut pending_requests, &format!("Transport error: {}, reconnect failed: {}", e, reconnect_err));
+                                    break;
+                                }
+                            }
                         }
                     }
                     Some(LoopCommand::StartSubscription {
@@ -2825,11 +2846,38 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
 
                         if let Err(error) = transport.send(&json).await {
                             tracing::error!(%error, "Subscription transport send error");
-                            fail_all_pending(
-                                &mut pending_requests,
-                                &format!("Transport error: {error}"),
-                            );
-                            break;
+                            // Attempt reconnection before failing pending requests
+                            match transport.reconnect().await {
+                                Ok(true) => {
+                                    tracing::info!("Reconnection succeeded, retrying subscription");
+                                    // Retry the send
+                                    if let Err(error) = transport.send(&json).await {
+                                        tracing::error!(%error, "Subscription transport send error after reconnect");
+                                        fail_all_pending(
+                                            &mut pending_requests,
+                                            &format!("Transport error after reconnect: {error}"),
+                                        );
+                                        break;
+                                    }
+                                    // Send succeeded after reconnect, continue
+                                }
+                                Ok(false) => {
+                                    tracing::warn!("Reconnection not supported or not attempted");
+                                    fail_all_pending(
+                                        &mut pending_requests,
+                                        &format!("Transport error: {error}"),
+                                    );
+                                    break;
+                                }
+                                Err(reconnect_err) => {
+                                    tracing::error!(error = %reconnect_err, "Reconnection failed");
+                                    fail_all_pending(
+                                        &mut pending_requests,
+                                        &format!("Transport error: {error}, reconnect failed: {reconnect_err}"),
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                     Some(LoopCommand::CancelRequest {
@@ -2923,11 +2971,39 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                     }
                     Ok(None) => {
                         tracing::info!("Transport closed (EOF)");
-                        break;
+                        // Attempt reconnection on EOF
+                        match transport.reconnect().await {
+                            Ok(true) => {
+                                tracing::info!("Reconnection succeeded after EOF, continuing");
+                                continue;
+                            }
+                            Ok(false) => {
+                                tracing::warn!("Reconnection not supported or not attempted after EOF");
+                                break;
+                            }
+                            Err(reconnect_err) => {
+                                tracing::error!(error = %reconnect_err, "Reconnection failed after EOF");
+                                break;
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Transport receive error");
-                        break;
+                        // Attempt reconnection on receive error
+                        match transport.reconnect().await {
+                            Ok(true) => {
+                                tracing::info!("Reconnection succeeded after receive error, continuing");
+                                continue;
+                            }
+                            Ok(false) => {
+                                tracing::warn!("Reconnection not supported or not attempted after receive error");
+                                break;
+                            }
+                            Err(reconnect_err) => {
+                                tracing::error!(error = %reconnect_err, "Reconnection failed after receive error");
+                                break;
+                            }
+                        }
                     }
                 }
             }

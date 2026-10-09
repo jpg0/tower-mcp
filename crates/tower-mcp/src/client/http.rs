@@ -421,6 +421,9 @@ pub struct HttpClientTransport {
     url: String,
     /// reqwest HTTP client (reused across requests).
     client: reqwest::Client,
+    /// Whether the caller supplied `client`. `reconnect()` rebuilds only a
+    /// client this transport built itself.
+    client_supplied: bool,
     /// Session ID received from the server after `initialize`.
     session_id: Option<String>,
     /// Negotiated protocol version.
@@ -495,6 +498,7 @@ impl HttpClientTransport {
         Self {
             url: url.into(),
             client: build_client(config.follow_cross_origin_redirects),
+            client_supplied: false,
             session_id: None,
             protocol_version: None,
             tool_header_mappings: HashMap::new(),
@@ -536,6 +540,7 @@ impl HttpClientTransport {
         Self {
             url: url.into(),
             client,
+            client_supplied: true,
             session_id: None,
             protocol_version: None,
             tool_header_mappings: HashMap::new(),
@@ -586,6 +591,7 @@ impl HttpClientTransport {
         Self {
             url: url.into(),
             client,
+            client_supplied: true,
             session_id: None,
             protocol_version: None,
             tool_header_mappings: HashMap::new(),
@@ -886,6 +892,51 @@ impl HttpClientTransport {
             })
             .await;
         }));
+    }
+
+    /// Reset the transport to a healthy connected state.
+    ///
+    /// Resets the `connected` flag, rebuilds the reqwest client if this
+    /// transport built it (to drop stale pooled connections; a
+    /// caller-supplied client is kept), clears stale state, restarts the SSE
+    /// stream (if a session exists), and drains stale channel messages. Useful when the proxy layer needs to explicitly reconnect
+    /// after detecting that the transport is dead but may recover.
+    ///
+    /// Returns `Ok(true)` if reconnection succeeded (SSE stream restarted
+    /// or no session to resume). Returns `Err` if SSE restart failed.
+    pub async fn reconnect(&mut self) -> Result<bool> {
+        tracing::info!(url = %self.url, "Resetting HTTP transport for reconnect");
+
+        // Abort existing SSE task if running
+        if let Some(task) = self.sse_task.take() {
+            task.abort();
+        }
+
+        // Clear stale state
+        *self.last_event_id.write().await = None;
+        *self.sse_retry_delay.write().await = None;
+
+        // Reset connected flag
+        self.connected.store(true, Ordering::Release);
+
+        // Rebuild a client this transport built, with the same redirect
+        // policy, to drop pooled connections that may be stale. A client the
+        // caller supplied is kept: rebuilding it would discard its TLS, proxy
+        // and timeout settings.
+        if !self.client_supplied {
+            self.client = build_client(self.config.follow_cross_origin_redirects);
+        }
+
+        // Drain any stale messages from the channel
+        while self.incoming_rx.try_recv().is_ok() {}
+
+        // If we have a session, restart the SSE stream
+        if self.session_id.is_some() && self.config.auto_sse {
+            self.start_sse_stream();
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 }
 
@@ -2103,6 +2154,10 @@ impl ClientTransport for HttpClientTransport {
             let _ = task.await;
         }
         Ok(())
+    }
+
+    async fn reconnect(&mut self) -> Result<bool> {
+        Self::reconnect(self).await
     }
 }
 

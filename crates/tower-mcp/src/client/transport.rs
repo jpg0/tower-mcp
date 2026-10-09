@@ -112,4 +112,20 @@ pub trait ClientTransport: Send + 'static {
     fn supports_session_recovery(&self) -> bool {
         false
     }
+
+    /// Attempt to reconnect the transport after a failure.
+    ///
+    /// This is called by the message loop when a transport error occurs,
+    /// before failing all pending requests. The transport should attempt
+    /// to re-establish its connection (e.g., restart SSE stream for HTTP).
+    ///
+    /// Returns `Ok(true)` if reconnection succeeded and the transport is ready
+    /// to send/receive again. Returns `Ok(false)` if reconnection was not
+    /// attempted or not applicable for this transport. Returns `Err` if
+    /// reconnection was attempted but failed.
+    ///
+    /// Default implementation returns `Ok(false)` (not supported).
+    async fn reconnect(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 }
