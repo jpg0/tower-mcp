@@ -37,6 +37,7 @@
 //! ```
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
@@ -46,12 +47,29 @@ use super::transport::ClientTransport;
 use crate::error::{Error, Result};
 use crate::framing::{FrameReader, InputFrame, clean_input_line};
 
+/// Default time to wait for a child process to exit after SIGTERM
+/// before escalating to SIGKILL.
+const DEFAULT_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default time to wait after sending SIGTERM before escalating to SIGKILL.
+const DEFAULT_SIGTERM_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Client transport that communicates with a subprocess via stdio.
 ///
 /// Spawns a child process and communicates using line-delimited JSON-RPC
 /// messages over stdin (write) and stdout (read). By default stderr is
 /// inherited so server debug output appears in the client's terminal. A
 /// caller using [`Self::spawn_command`] may redirect or pipe it instead.
+///
+/// # Shutdown Behavior
+///
+/// On [`close()`](ClientTransport::close), the transport drops stdin to signal
+/// EOF, then sends `SIGTERM` (on Unix) and waits for the child to exit. If
+/// the child does not exit within `sigterm_timeout`, `SIGKILL` is sent. The
+/// total shutdown time is `sigterm_timeout + kill_timeout` (default 3s).
+///
+/// On Windows, `SIGTERM` is skipped and `kill()` (TerminateProcess) is used
+/// directly after the kill timeout.
 pub struct StdioClientTransport {
     child: Option<Child>,
     stdin: Option<tokio::process::ChildStdin>,
@@ -62,6 +80,11 @@ pub struct StdioClientTransport {
     // It also frames over bytes rather than decoded text, so output the
     // decoder rejects costs one frame instead of the connection (#1296).
     stdout: FrameReader<tokio::process::ChildStdout>,
+    /// Maximum time to wait after SIGTERM before sending SIGKILL.
+    kill_timeout: Duration,
+    /// Time to wait for the child to exit after SIGTERM before sending
+    /// SIGKILL. `None` means skip SIGTERM and kill immediately.
+    sigterm_timeout: Option<Duration>,
 }
 
 impl StdioClientTransport {
@@ -140,6 +163,8 @@ impl StdioClientTransport {
                 stdout,
                 crate::framing::DEFAULT_MAX_RESPONSE_FRAME_LEN,
             ),
+            kill_timeout: DEFAULT_KILL_TIMEOUT,
+            sigterm_timeout: Some(DEFAULT_SIGTERM_TIMEOUT),
         })
     }
 
@@ -167,6 +192,29 @@ impl StdioClientTransport {
     /// ```
     pub fn max_frame_len(mut self, bytes: usize) -> Self {
         self.stdout.set_max_len(bytes);
+        self
+    }
+
+    /// Set the maximum time to wait for the child process to exit after
+    /// being asked to terminate (default: 2s).
+    ///
+    /// After dropping stdin and sending `SIGTERM` (if `sigterm_timeout` is
+    /// set), the transport waits at most this duration before sending
+    /// `SIGKILL`. The total close time is bounded by
+    /// `sigterm_timeout + kill_timeout`.
+    pub fn kill_timeout(mut self, timeout: Duration) -> Self {
+        self.kill_timeout = timeout;
+        self
+    }
+
+    /// Set the time to wait for the child to exit after `SIGTERM` before
+    /// escalating to `SIGKILL` (default: `Some(1s)`).
+    ///
+    /// Pass `None` to skip `SIGTERM` entirely and send `SIGKILL` after
+    /// `kill_timeout`.
+    #[cfg(unix)]
+    pub fn sigterm_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.sigterm_timeout = timeout;
         self
     }
 
@@ -199,6 +247,8 @@ impl StdioClientTransport {
                 stdout,
                 crate::framing::DEFAULT_MAX_RESPONSE_FRAME_LEN,
             ),
+            kill_timeout: DEFAULT_KILL_TIMEOUT,
+            sigterm_timeout: Some(DEFAULT_SIGTERM_TIMEOUT),
         })
     }
 }
@@ -268,12 +318,50 @@ impl ClientTransport for StdioClientTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
-        // Drop stdin to signal EOF to the child process
+        // Drop stdin to signal EOF to the child process.
         self.stdin.take();
 
         if let Some(mut child) = self.child.take() {
-            let result =
-                tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+            // On Unix: send SIGTERM first, wait sigterm_timeout, then SIGKILL.
+            // On non-Unix: skip SIGTERM, wait kill_timeout, then kill.
+            #[cfg(unix)]
+            {
+                if let Some(sigterm_wait) = self.sigterm_timeout {
+                    // Best-effort SIGTERM via libc::kill — process may already be gone.
+                    if let Some(pid) = child.id() {
+                        // SAFETY: pid is a valid non-zero value from tokio's Child.
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
+                    }
+                    tracing::debug!(
+                        sigterm_wait_ms = sigterm_wait.as_millis() as u64,
+                        "Sent SIGTERM to child, waiting for exit"
+                    );
+
+                    let result = tokio::time::timeout(sigterm_wait, child.wait()).await;
+                    match result {
+                        Ok(Ok(status)) => {
+                            tracing::info!(status = ?status, "Child exited after SIGTERM");
+                            return Ok(());
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, "Error waiting for child after SIGTERM");
+                            return Ok(());
+                        }
+                        Err(_timeout) => {
+                            tracing::debug!(
+                                kill_timeout_ms = self.kill_timeout.as_millis() as u64,
+                                "Child did not exit after SIGTERM, escalating to SIGKILL"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // SIGKILL (or sole termination path on non-Unix): wait kill_timeout,
+            // then force-kill.
+            let result = tokio::time::timeout(self.kill_timeout, child.wait()).await;
 
             match result {
                 Ok(Ok(status)) => {
@@ -283,7 +371,10 @@ impl ClientTransport for StdioClientTransport {
                     tracing::error!(error = %e, "Error waiting for child");
                 }
                 Err(_) => {
-                    tracing::warn!("Timeout waiting for child, killing");
+                    tracing::warn!(
+                        kill_timeout_ms = self.kill_timeout.as_millis() as u64,
+                        "Timeout waiting for child, sending SIGKILL"
+                    );
                     let _ = child.kill().await;
                 }
             }
@@ -608,5 +699,40 @@ mod tests {
 
         let received = transport.recv().await.unwrap();
         assert_eq!(received.as_deref(), Some(msg));
+    }
+
+    /// Verify SIGTERM → SIGKILL escalation: spawn a child that ignores
+    /// SIGTERM, configure short timeouts, and confirm `close()` completes
+    /// (the child is killed via SIGKILL after the timeouts expire).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_close_sigterm_to_sigkill_escalation() {
+        // This shell traps SIGTERM and does nothing, so it will only die
+        // from SIGKILL.
+        let mut transport = StdioClientTransport::spawn("sh", &["-c", "trap '' TERM; sleep 30"])
+            .await
+            .unwrap();
+
+        assert!(transport.is_connected());
+
+        // Configure very short timeouts to keep the test fast:
+        // 50ms SIGTERM wait, then 50ms kill wait.
+        transport.kill_timeout = Duration::from_millis(50);
+        transport.sigterm_timeout = Some(Duration::from_millis(50));
+
+        let start = std::time::Instant::now();
+        transport.close().await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            !transport.is_connected(),
+            "transport must be disconnected after close"
+        );
+        // Total time should be roughly sigterm_timeout + kill_timeout = 100ms,
+        // plus some overhead. Allow up to 2s for CI variability.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "close took {elapsed:?}, expected < 2s (sigterm+kill ~100ms)"
+        );
     }
 }
