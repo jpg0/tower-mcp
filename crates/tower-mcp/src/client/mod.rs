@@ -2705,6 +2705,11 @@ fn decode_cached<R: serde::de::DeserializeOwned>(
 
 impl Drop for McpClient {
     fn drop(&mut self) {
+        // Best-effort: ask the message loop to shut down gracefully so its
+        // cleanup block (which calls `transport.close()`) can run. `try_send`
+        // is non-blocking — Drop cannot await. If the channel is full or
+        // closed the graceful path is skipped.
+        let _ = self.command_tx.try_send(LoopCommand::Shutdown);
         if let Some(task) = self.task.take() {
             task.abort();
         }
