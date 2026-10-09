@@ -1901,4 +1901,125 @@ mod proxy_tests {
         assert_eq!(proxy.backend_count(), 0);
         assert!(proxy.backend_namespaces().is_empty());
     }
+
+    /// Test: init_timeout fires when a backend never responds to initialize.
+    ///
+    /// Uses a stdio backend (`sleep 999`) that never writes anything, so
+    /// the MCP initialize handshake hangs. With a short init_timeout, the
+    /// backend should fail with a "timed out" error. Since it's the only
+    /// backend, `build()` returns `Err("All backends failed to initialize")`.
+    #[tokio::test]
+    async fn test_init_timeout_fires_on_silent_backend() {
+        use crate::client::StdioClientTransport;
+
+        let transport = StdioClientTransport::spawn("sleep", &["999"])
+            .await
+            .expect("failed to spawn sleep process");
+
+        let result = McpProxy::builder("test-proxy", "1.0.0")
+            .init_timeout(Duration::from_secs(2))
+            .backend("sleepy", transport)
+            .await
+            .build()
+            .await;
+
+        // When the only backend fails to init, build() returns Err wrapping the
+        // generic "all backends failed" message. The specific timeout error is
+        // logged. Verify the build failed (the timeout test with a healthy backend
+        // proves the specific error message).
+        match result {
+            Ok(_) => panic!("build should fail when all backends time out"),
+            Err(e) => {
+                let err_msg = format!("{e}");
+                assert!(
+                    err_msg.contains("failed to initialize") || err_msg.contains("timed out"),
+                    "Error should indicate backend failure, got: {err_msg}"
+                );
+            }
+        }
+    }
+
+    /// Test: init_timeout with one healthy + one silent backend.
+    ///
+    /// Verifies that when one backend times out and another succeeds,
+    /// `build()` returns `Ok` with the timed-out backend in `skipped`.
+    #[tokio::test]
+    async fn test_init_timeout_skips_silent_with_healthy_backend() {
+        use crate::client::StdioClientTransport;
+        use crate::proxy::SkippedPhase;
+
+        let ping = ToolBuilder::new("ping")
+            .description("Ping")
+            .handler(|_: HashMap<String, String>| async { Ok(CallToolResult::text("pong")) })
+            .build();
+
+        let router = McpRouter::new()
+            .server_info("fast-server", "1.0.0")
+            .tool(ping);
+        let healthy_transport = ChannelTransport::new(router);
+
+        let silent_transport = StdioClientTransport::spawn("sleep", &["999"])
+            .await
+            .expect("failed to spawn sleep process");
+
+        let build_result = McpProxy::builder("test-proxy", "1.0.0")
+            .init_timeout(Duration::from_secs(2))
+            .backend("healthy", healthy_transport)
+            .await
+            .backend("silent", silent_transport)
+            .await
+            .build()
+            .await
+            .expect("build should succeed with at least one healthy backend");
+
+        // Exactly one backend should be skipped
+        assert_eq!(
+            build_result.skipped.len(),
+            1,
+            "Expected exactly one skipped backend"
+        );
+        let skipped = &build_result.skipped[0];
+        assert_eq!(skipped.namespace, "silent");
+        assert_eq!(skipped.phase, SkippedPhase::Initialize);
+        let err_msg = format!("{}", skipped.error);
+        assert!(
+            err_msg.contains("timed out"),
+            "Error should mention timeout, got: {err_msg}"
+        );
+
+        // Proxy should have one backend
+        assert_eq!(build_result.proxy.backend_count(), 1);
+    }
+
+    /// Test: no init_timeout means backend initialization can take as long as needed.
+    ///
+    /// Uses a responsive backend (ChannelTransport with a proper router) and
+    /// verifies that with no init_timeout set, the build succeeds.
+    #[tokio::test]
+    async fn test_default_no_init_timeout_allows_normal_init() {
+        let ping = ToolBuilder::new("ping")
+            .description("Ping")
+            .handler(|_: HashMap<String, String>| async { Ok(CallToolResult::text("pong")) })
+            .build();
+
+        let router = McpRouter::new()
+            .server_info("fast-server", "1.0.0")
+            .tool(ping);
+
+        let transport = ChannelTransport::new(router);
+
+        // No init_timeout set — should succeed
+        let result = McpProxy::builder("test-proxy", "1.0.0")
+            .backend("fast", transport)
+            .await
+            .build()
+            .await;
+
+        let build_result = result.expect("build should succeed");
+        assert!(
+            build_result.skipped.is_empty(),
+            "No backends should be skipped for a responsive backend"
+        );
+        assert_eq!(build_result.proxy.backend_count(), 1);
+    }
 }

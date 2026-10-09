@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 use std::fmt;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tower::Layer;
@@ -61,6 +62,8 @@ struct PendingBackend {
     /// Type-erased service (set by `.backend_layer()`).
     /// If None, BackendService is used directly.
     custom_service: Option<BoxCloneService<RouterRequest, RouterResponse, Infallible>>,
+    /// Per-backend initialization timeout. If None, uses the builder's global init_timeout.
+    init_timeout: Option<Duration>,
 }
 
 /// Backends that failed during `backend()` connection, tracked until `build()`.
@@ -114,6 +117,8 @@ pub struct McpProxyBuilder {
     connection_failures: Vec<ConnectionFailure>,
     /// Custom instructions override. If set, used instead of aggregated backend instructions.
     instructions: Option<String>,
+    /// Timeout for backend initialization handshake. `None` means no timeout (backward compat).
+    init_timeout: Option<Duration>,
 }
 
 impl McpProxyBuilder {
@@ -127,6 +132,7 @@ impl McpProxyBuilder {
             notification_tx: None,
             connection_failures: Vec::new(),
             instructions: None,
+            init_timeout: None,
         }
     }
 
@@ -176,6 +182,30 @@ impl McpProxyBuilder {
         self
     }
 
+    /// Set a timeout for backend initialization.
+    ///
+    /// When set, each backend's `initialize` handshake is wrapped
+    /// in [`tokio::time::timeout`] so that a non-responsive backend cannot
+    /// hang the proxy construction forever.
+    ///
+    /// `None` (the default) means no timeout — backends may initialize
+    /// indefinitely, preserving backward compatibility.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    ///
+    /// let proxy = McpProxy::builder("proxy", "1.0.0")
+    ///     .init_timeout(Duration::from_secs(30))
+    ///     .backend("db", transport).await
+    ///     .build().await?;
+    /// ```
+    pub fn init_timeout(mut self, timeout: Duration) -> Self {
+        self.init_timeout = Some(timeout);
+        self
+    }
+
     /// Add a backend from a connected [`McpClient`].
     ///
     /// Note: backends added this way will not have automatic cache refresh
@@ -188,6 +218,7 @@ impl McpProxyBuilder {
             backend,
             invalidation_rx: None,
             custom_service: None,
+            init_timeout: None,
         });
         self
     }
@@ -219,6 +250,7 @@ impl McpProxyBuilder {
                     backend,
                     invalidation_rx: Some(invalidation_rx),
                     custom_service: None,
+                    init_timeout: None,
                 });
             }
             Err(e) => {
@@ -268,6 +300,7 @@ impl McpProxyBuilder {
             backend,
             invalidation_rx: Some(invalidation_rx),
             custom_service: None,
+            init_timeout: None,
         });
 
         Ok(self)
@@ -334,6 +367,36 @@ impl McpProxyBuilder {
         let caught = CatchError::new(layered);
         pending.custom_service = Some(BoxCloneService::new(caught));
 
+        self
+    }
+
+    /// Set the initialization timeout for the most recently added backend.
+    ///
+    /// This overrides the global [`init_timeout`](Self::init_timeout) for this
+    /// specific backend. If not called, the backend will use the global
+    /// init_timeout (or no timeout if the global is not set).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::time::Duration;
+    ///
+    /// let proxy = McpProxy::builder("proxy", "1.0.0")
+    ///     .backend("slow-stdio", transport1).await
+    ///     .backend_init_timeout(Duration::from_secs(60))
+    ///     .backend("fast-http", transport2).await
+    ///     .build().await?;
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if no backend has been added yet.
+    pub fn backend_init_timeout(mut self, timeout: Duration) -> Self {
+        let pending = self
+            .pending
+            .last_mut()
+            .expect("backend_init_timeout called before adding a backend");
+        pending.init_timeout = Some(timeout);
         self
     }
 
@@ -404,14 +467,31 @@ impl McpProxyBuilder {
         // Initialize all backends concurrently
         let name = self.name.clone();
         let version = self.version.clone();
+        let global_init_timeout = self.init_timeout;
         let init_futures: Vec<_> = self
             .pending
             .into_iter()
             .map(|mut pb| {
                 let name = name.clone();
                 let version = version.clone();
+                // Per-backend init_timeout takes precedence over global
+                let init_timeout = pb.init_timeout.or(global_init_timeout);
                 async move {
-                    match pb.backend.initialize(&name, &version).await {
+                    let init_future = pb.backend.initialize(&name, &version);
+                    let result = if let Some(timeout) = init_timeout {
+                        tokio::time::timeout(timeout, init_future)
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(Error::internal(format!(
+                                    "Backend '{}' initialization timed out after {}s",
+                                    pb.namespace,
+                                    timeout.as_secs()
+                                )))
+                            })
+                    } else {
+                        init_future.await
+                    };
+                    match result {
                         Ok(instructions) => {
                             pb.backend.instructions = instructions;
                             {
@@ -515,6 +595,7 @@ impl McpProxyBuilder {
             self.notification_tx,
             instructions,
             self.separator.clone(),
+            global_init_timeout,
         );
 
         // Spawn invalidation watchers for backends with notification handlers.

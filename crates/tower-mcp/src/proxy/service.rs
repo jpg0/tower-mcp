@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 use tower::ServiceExt;
@@ -106,6 +107,8 @@ pub(super) struct McpProxyShared {
     instructions: Option<String>,
     /// Separator used for namespace prefixing.
     separator: String,
+    /// Timeout for backend initialization handshake (shared with hot-reload paths).
+    pub(crate) init_timeout: Option<std::time::Duration>,
 }
 
 /// Health status of a single backend.
@@ -170,6 +173,7 @@ impl McpProxy {
     }
 
     /// Create a new proxy with the given backends and entries (called by builder).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: String,
         version: String,
@@ -178,6 +182,7 @@ impl McpProxy {
         notification_tx: Option<crate::context::NotificationSender>,
         instructions: Option<String>,
         separator: String,
+        init_timeout: Option<std::time::Duration>,
     ) -> Self {
         Self {
             shared: Arc::new(McpProxyShared {
@@ -187,6 +192,7 @@ impl McpProxy {
                 notification_tx,
                 instructions,
                 separator,
+                init_timeout,
             }),
             entries: Arc::new(Mutex::new(entries)),
         }
@@ -217,6 +223,21 @@ impl McpProxy {
         namespace: impl Into<String>,
         transport: impl ClientTransport,
     ) -> Result<(), AddBackendError> {
+        self.add_backend_with_timeout(namespace, transport, None)
+            .await
+    }
+
+    /// Add a backend dynamically with a custom initialization timeout.
+    ///
+    /// Like [`add_backend()`](Self::add_backend), but allows specifying a
+    /// per-backend initialization timeout that overrides the proxy's global
+    /// `init_timeout`.
+    pub async fn add_backend_with_timeout(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl ClientTransport,
+        init_timeout: Option<Duration>,
+    ) -> Result<(), AddBackendError> {
         let namespace = namespace.into();
         let separator = self.shared.separator.clone();
 
@@ -232,10 +253,27 @@ impl McpProxy {
             .await
             .map_err(AddBackendError::Connect)?;
 
-        backend
-            .initialize(&self.shared.name, &self.shared.version)
+        // Use per-backend timeout if provided, otherwise fall back to global
+        let timeout = init_timeout.or(self.shared.init_timeout);
+        let init_result = if let Some(timeout) = timeout {
+            tokio::time::timeout(
+                timeout,
+                backend.initialize(&self.shared.name, &self.shared.version),
+            )
             .await
-            .map_err(AddBackendError::Initialize)?;
+            .unwrap_or_else(|_| {
+                Err(crate::error::Error::internal(format!(
+                    "Backend '{}' initialization timed out after {}s",
+                    namespace,
+                    timeout.as_secs()
+                )))
+            })
+        } else {
+            backend
+                .initialize(&self.shared.name, &self.shared.version)
+                .await
+        };
+        init_result.map_err(AddBackendError::Initialize)?;
 
         let entry = BackendEntry::from_backend(&backend);
 
@@ -290,6 +328,27 @@ impl McpProxy {
         <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
         <L::Service as Service<RouterRequest>>::Future: Send,
     {
+        self.add_backend_with_layer_and_timeout(namespace, transport, layer, None)
+            .await
+    }
+
+    /// Add a backend dynamically with a custom middleware-wrapped service and custom initialization timeout.
+    ///
+    /// Like [`add_backend_with_layer()`](Self::add_backend_with_layer), but allows specifying a
+    /// per-backend initialization timeout that overrides the proxy's global `init_timeout`.
+    pub async fn add_backend_with_layer_and_timeout<L>(
+        &self,
+        namespace: impl Into<String>,
+        transport: impl ClientTransport,
+        layer: L,
+        init_timeout: Option<Duration>,
+    ) -> Result<(), AddBackendError>
+    where
+        L: tower::Layer<BackendService> + Send + 'static,
+        L::Service: Service<RouterRequest, Response = RouterResponse> + Clone + Send + 'static,
+        <L::Service as Service<RouterRequest>>::Error: fmt::Display + Send,
+        <L::Service as Service<RouterRequest>>::Future: Send,
+    {
         let namespace = namespace.into();
         let separator = self.shared.separator.clone();
 
@@ -303,10 +362,27 @@ impl McpProxy {
             .await
             .map_err(AddBackendError::Connect)?;
 
-        backend
-            .initialize(&self.shared.name, &self.shared.version)
+        // Use per-backend timeout if provided, otherwise fall back to global
+        let timeout = init_timeout.or(self.shared.init_timeout);
+        let init_result = if let Some(timeout) = timeout {
+            tokio::time::timeout(
+                timeout,
+                backend.initialize(&self.shared.name, &self.shared.version),
+            )
             .await
-            .map_err(AddBackendError::Initialize)?;
+            .unwrap_or_else(|_| {
+                Err(crate::error::Error::internal(format!(
+                    "Backend '{}' initialization timed out after {}s",
+                    namespace,
+                    timeout.as_secs()
+                )))
+            })
+        } else {
+            backend
+                .initialize(&self.shared.name, &self.shared.version)
+                .await
+        };
+        init_result.map_err(AddBackendError::Initialize)?;
 
         // Apply middleware layer
         let base = backend.service();
