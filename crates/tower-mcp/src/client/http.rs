@@ -555,6 +555,56 @@ impl HttpClientTransport {
         }
     }
 
+    /// Create with an existing `reqwest::Client` and custom `HttpClientConfig`.
+    ///
+    /// Use this when you need both custom TLS/connection pooling settings
+    /// AND custom HTTP client configuration (timeouts, SSE settings, etc.).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::client::{HttpClientTransport, HttpClientConfig};
+    /// use std::time::Duration;
+    ///
+    /// let client = reqwest::Client::builder()
+    ///     .danger_accept_invalid_certs(true) // for development
+    ///     .build()
+    ///     .unwrap();
+    /// let config = HttpClientConfig {
+    ///     request_timeout: Duration::from_secs(60),
+    ///     sse_reconnect: false,
+    ///     ..Default::default()
+    /// };
+    /// let transport = HttpClientTransport::with_client_and_config("https://mcp.example.com", client, config);
+    /// ```
+    pub fn with_client_and_config(
+        url: impl Into<String>,
+        client: reqwest::Client,
+        config: HttpClientConfig,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(config.channel_capacity);
+        Self {
+            url: url.into(),
+            client,
+            session_id: None,
+            protocol_version: None,
+            tool_header_mappings: HashMap::new(),
+            incoming_rx: rx,
+            incoming_tx: tx,
+            sse_task: None,
+            request_tasks: HashMap::new(),
+            last_event_id: Arc::new(RwLock::new(None)),
+            sse_retry_delay: Arc::new(RwLock::new(None)),
+            sse_reconnect_signal: Arc::new(Notify::new()),
+            connected: Arc::new(AtomicBool::new(true)),
+            config,
+            #[cfg(feature = "oauth-client")]
+            token_provider: None,
+            #[cfg(feature = "oauth-client")]
+            scope_escalation: None,
+        }
+    }
+
     /// Set a Bearer token for `Authorization: Bearer <token>` authentication.
     ///
     /// The token is included on every HTTP request (POST and SSE GET).
@@ -2541,6 +2591,22 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `with_client_and_config` must keep the caller's config: `with_client`
+    /// always used the default one, which dropped the caller's request timeout.
+    #[test]
+    fn with_client_and_config_keeps_the_callers_config() {
+        let config = HttpClientConfig {
+            request_timeout: Duration::from_secs(42),
+            ..Default::default()
+        };
+        let transport = HttpClientTransport::with_client_and_config(
+            "http://localhost:1",
+            reqwest::Client::new(),
+            config,
+        );
+        assert_eq!(transport.config.request_timeout, Duration::from_secs(42));
+    }
     #[cfg(all(feature = "oauth-client", feature = "http"))]
     use crate::client::{
         OAuthAuthorizationAction, OAuthAuthorizationFlow, OAuthAuthorizationHandler,
