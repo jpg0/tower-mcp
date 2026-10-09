@@ -416,12 +416,12 @@ impl McpProxyBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if no backends were configured or if all backends
-    /// failed to initialize.
+    /// Returns an error if backends were configured but all failed to
+    /// initialize, or if namespace validation fails. An empty proxy (zero
+    /// backends) is valid — it serves empty capability lists and is useful
+    /// when all backends are lazy and served via a warm-catalog layer.
     pub async fn build(mut self) -> Result<ProxyBuildResult> {
-        if self.pending.is_empty() {
-            return Err(Error::internal("No backends configured"));
-        }
+        let had_pending = !self.pending.is_empty();
 
         // Ensure all backends use the builder's final separator.
         // This handles the case where `.separator()` is called after `.backend()`.
@@ -562,7 +562,7 @@ impl McpProxyBuilder {
             backends.push(pb.backend);
         }
 
-        if backends.is_empty() {
+        if had_pending && backends.is_empty() {
             return Err(Error::internal("All backends failed to initialize"));
         }
 

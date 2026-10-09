@@ -535,12 +535,6 @@ mod proxy_tests {
     // ========================================================================
 
     #[tokio::test]
-    async fn test_proxy_builder_rejects_empty_backends() {
-        let result = McpProxy::builder("empty", "1.0.0").build().await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_proxy_builder_rejects_duplicate_namespaces() {
         let t1 = ChannelTransport::new(math_router());
         let t2 = ChannelTransport::new(text_router());
@@ -2021,5 +2015,19 @@ mod proxy_tests {
             "No backends should be skipped for a responsive backend"
         );
         assert_eq!(build_result.proxy.backend_count(), 1);
+    }
+
+    /// A proxy with no backends builds: a caller that starts its backends
+    /// lazily has none at build time and adds them later.
+    #[tokio::test]
+    async fn test_build_with_no_backends_returns_an_empty_proxy() {
+        let build_result = McpProxy::builder("test-proxy", "1.0.0")
+            .build()
+            .await
+            .expect("a proxy with no backends must build");
+
+        assert!(build_result.skipped.is_empty());
+        assert_eq!(build_result.proxy.backend_count(), 0);
+        assert!(build_result.proxy.backend_namespaces().is_empty());
     }
 }
