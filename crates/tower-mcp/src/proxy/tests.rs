@@ -2030,4 +2030,148 @@ mod proxy_tests {
         assert_eq!(build_result.proxy.backend_count(), 0);
         assert!(build_result.proxy.backend_namespaces().is_empty());
     }
+
+    /// A server that only implements 2024-11-05: it answers `initialize`
+    /// with that version whatever the client offered.
+    struct LegacyServerTransport {
+        tx: tokio::sync::mpsc::Sender<String>,
+        rx: tokio::sync::mpsc::Receiver<String>,
+    }
+
+    impl LegacyServerTransport {
+        fn new() -> Self {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            Self { tx, rx }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::client::ClientTransport for LegacyServerTransport {
+        async fn send(&mut self, message: &str) -> crate::error::Result<()> {
+            let request: serde_json::Value = serde_json::from_str(message)
+                .map_err(|e| crate::error::Error::internal(e.to_string()))?;
+            let Some(id) = request.get("id").cloned() else {
+                return Ok(());
+            };
+            let result = match request["method"].as_str().unwrap_or_default() {
+                "initialize" => json!({
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "legacy", "version": "0.1.0"},
+                    "capabilities": {"tools": {}}
+                }),
+                "tools/list" => json!({
+                    "tools": [{"name": "hello", "inputSchema": {"type": "object"}}]
+                }),
+                "resources/list" => json!({"resources": []}),
+                "resources/templates/list" => json!({"resourceTemplates": []}),
+                "prompts/list" => json!({"prompts": []}),
+                _ => json!({}),
+            };
+            let _ = self
+                .tx
+                .try_send(json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string());
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> crate::error::Result<Option<String>> {
+            Ok(self.rx.recv().await)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        async fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// By default a backend that selects 2024-11-05 is skipped, as before.
+    #[tokio::test]
+    async fn proxy_skips_a_2024_11_05_backend_by_default() {
+        let result = McpProxy::builder("legacy-default", "1.0.0")
+            .backend("legacy", LegacyServerTransport::new())
+            .await
+            .backend("math", ChannelTransport::new(math_router()))
+            .await
+            .build()
+            .await
+            .expect("the math backend keeps the proxy buildable");
+
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].namespace, "legacy");
+        assert!(
+            result.skipped[0].error.to_string().contains("2024-11-05"),
+            "got: {}",
+            result.skipped[0].error
+        );
+    }
+
+    /// The opt-in applies to backends added before it was set: the switch
+    /// is read when the build initializes them, not when they were added.
+    #[tokio::test]
+    async fn proxy_initializes_a_2024_11_05_backend_when_opted_in() {
+        let result = McpProxy::builder("legacy-opt-in", "1.0.0")
+            .backend("legacy", LegacyServerTransport::new())
+            .await
+            .accept_protocol_2024_11_05(true)
+            .build()
+            .await
+            .expect("an opted-in proxy must initialize the legacy backend");
+
+        let skipped: Vec<String> = result
+            .skipped
+            .iter()
+            .map(|s| format!("{}: {}", s.namespace, s.error))
+            .collect();
+        assert!(skipped.is_empty(), "skipped: {skipped:?}");
+        let mut proxy = result.proxy;
+        let resp = call_proxy(&mut proxy, McpRequest::ListTools(Default::default()))
+            .await
+            .expect("list tools should succeed");
+        match resp {
+            McpResponse::ListTools(list) => {
+                let names: Vec<&str> = list.tools.iter().map(|t| t.name.as_str()).collect();
+                assert_eq!(names, ["legacy_hello"]);
+            }
+            other => panic!("expected ListTools, got: {other:?}"),
+        }
+    }
+
+    /// Backends added after the build (hot reload, lazy spawn) follow the
+    /// proxy's setting on both add paths.
+    #[tokio::test]
+    async fn add_backend_follows_the_2024_11_05_setting() {
+        let proxy = McpProxy::builder("legacy-add", "1.0.0")
+            .accept_protocol_2024_11_05(true)
+            .build()
+            .await
+            .expect("empty proxy builds")
+            .proxy;
+        proxy
+            .add_backend("legacy", LegacyServerTransport::new())
+            .await
+            .expect("an opted-in proxy must add a legacy backend");
+        proxy
+            .add_backend_with_layer(
+                "other",
+                LegacyServerTransport::new(),
+                tower::layer::util::Identity::new(),
+            )
+            .await
+            .expect("the layered add path must honour the opt-in too");
+        assert_eq!(proxy.backend_count(), 2);
+
+        let default_proxy = McpProxy::builder("legacy-add-default", "1.0.0")
+            .build()
+            .await
+            .expect("empty proxy builds")
+            .proxy;
+        let error = default_proxy
+            .add_backend("legacy", LegacyServerTransport::new())
+            .await
+            .expect_err("without the opt-in a legacy backend must be refused");
+        assert!(error.to_string().contains("2024-11-05"), "got: {error}");
+        assert_eq!(default_proxy.backend_count(), 0);
+    }
 }

@@ -119,6 +119,8 @@ pub struct McpProxyBuilder {
     instructions: Option<String>,
     /// Timeout for backend initialization handshake. `None` means no timeout (backward compat).
     init_timeout: Option<Duration>,
+    /// Whether backends may answer `initialize` with 2024-11-05.
+    accept_protocol_2024_11_05: bool,
 }
 
 impl McpProxyBuilder {
@@ -133,6 +135,7 @@ impl McpProxyBuilder {
             connection_failures: Vec::new(),
             instructions: None,
             init_timeout: None,
+            accept_protocol_2024_11_05: false,
         }
     }
 
@@ -203,6 +206,18 @@ impl McpProxyBuilder {
     /// ```
     pub fn init_timeout(mut self, timeout: Duration) -> Self {
         self.init_timeout = Some(timeout);
+        self
+    }
+
+    /// Accept backends that answer `initialize` with protocol version
+    /// `2024-11-05`.
+    ///
+    /// Applies to every backend this builder initializes, whenever it was
+    /// added, and to backends added later through
+    /// [`McpProxy::add_backend`] and its variants. Off by default. See
+    /// [`McpClientBuilder::accept_protocol_2024_11_05`](crate::client::McpClientBuilder::accept_protocol_2024_11_05).
+    pub fn accept_protocol_2024_11_05(mut self, accept: bool) -> Self {
+        self.accept_protocol_2024_11_05 = accept;
         self
     }
 
@@ -468,6 +483,7 @@ impl McpProxyBuilder {
         let name = self.name.clone();
         let version = self.version.clone();
         let global_init_timeout = self.init_timeout;
+        let accept_protocol_2024_11_05 = self.accept_protocol_2024_11_05;
         let init_futures: Vec<_> = self
             .pending
             .into_iter()
@@ -476,6 +492,9 @@ impl McpProxyBuilder {
                 let version = version.clone();
                 // Per-backend init_timeout takes precedence over global
                 let init_timeout = pb.init_timeout.or(global_init_timeout);
+                if accept_protocol_2024_11_05 {
+                    pb.backend.client.set_accept_protocol_2024_11_05(true);
+                }
                 async move {
                     let init_future = pb.backend.initialize(&name, &version);
                     let result = if let Some(timeout) = init_timeout {
@@ -596,6 +615,7 @@ impl McpProxyBuilder {
             instructions,
             self.separator.clone(),
             global_init_timeout,
+            accept_protocol_2024_11_05,
         );
 
         // Spawn invalidation watchers for backends with notification handlers.

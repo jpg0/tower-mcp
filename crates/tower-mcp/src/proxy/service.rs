@@ -109,6 +109,9 @@ pub(super) struct McpProxyShared {
     separator: String,
     /// Timeout for backend initialization handshake (shared with hot-reload paths).
     pub(crate) init_timeout: Option<std::time::Duration>,
+    /// Whether backends may answer `initialize` with 2024-11-05 (shared with
+    /// hot-reload paths).
+    accept_protocol_2024_11_05: bool,
 }
 
 /// Health status of a single backend.
@@ -183,6 +186,7 @@ impl McpProxy {
         instructions: Option<String>,
         separator: String,
         init_timeout: Option<std::time::Duration>,
+        accept_protocol_2024_11_05: bool,
     ) -> Self {
         Self {
             shared: Arc::new(McpProxyShared {
@@ -193,6 +197,7 @@ impl McpProxy {
                 instructions,
                 separator,
                 init_timeout,
+                accept_protocol_2024_11_05,
             }),
             entries: Arc::new(Mutex::new(entries)),
         }
@@ -252,6 +257,9 @@ impl McpProxy {
         let backend = Backend::connect(namespace.clone(), transport, separator, invalidation_tx)
             .await
             .map_err(AddBackendError::Connect)?;
+        if self.shared.accept_protocol_2024_11_05 {
+            backend.client.set_accept_protocol_2024_11_05(true);
+        }
 
         // Use per-backend timeout if provided, otherwise fall back to global
         let timeout = init_timeout.or(self.shared.init_timeout);
@@ -361,6 +369,9 @@ impl McpProxy {
         let backend = Backend::connect(namespace.clone(), transport, separator, invalidation_tx)
             .await
             .map_err(AddBackendError::Connect)?;
+        if self.shared.accept_protocol_2024_11_05 {
+            backend.client.set_accept_protocol_2024_11_05(true);
+        }
 
         // Use per-backend timeout if provided, otherwise fall back to global
         let timeout = init_timeout.or(self.shared.init_timeout);

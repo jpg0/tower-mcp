@@ -426,6 +426,9 @@ pub struct McpClient {
     capabilities: ClientCapabilities,
     /// Exact ordered set of protocol implementations enabled for this client.
     protocol_support: ProtocolSupport,
+    /// Whether `initialize` also accepts a server that selects 2024-11-05.
+    /// Off by default; see [`McpClientBuilder::accept_protocol_2024_11_05`].
+    accept_protocol_2024_11_05: AtomicBool,
     /// Protocol selected by the discover-based final lifecycle.
     selected_protocol_version: RwLock<Option<String>>,
     /// Client identity repeated in final-protocol request metadata.
@@ -462,6 +465,7 @@ struct ClientSettings {
     capabilities: ClientCapabilities,
     roots: Vec<Root>,
     protocol_support: ProtocolSupport,
+    accept_protocol_2024_11_05: bool,
     max_mrtr_rounds: usize,
     cache_config: ClientCacheConfig,
     request_progress: bool,
@@ -511,6 +515,7 @@ pub struct McpClientBuilder {
     capabilities: ClientCapabilities,
     roots: Vec<Root>,
     protocol_support: ProtocolSupport,
+    accept_protocol_2024_11_05: bool,
     max_mrtr_rounds: usize,
     cache_config: ClientCacheConfig,
     request_progress: bool,
@@ -529,6 +534,7 @@ impl McpClientBuilder {
             // client's wire behavior, it only removes the configuration step
             // before `discover`.
             protocol_support: ProtocolSupport::default(),
+            accept_protocol_2024_11_05: false,
             max_mrtr_rounds: 8,
             cache_config: ClientCacheConfig::default(),
             request_progress: false,
@@ -614,6 +620,27 @@ impl McpClientBuilder {
         self
     }
 
+    /// Also accept a server that answers `initialize` with protocol version
+    /// `2024-11-05`.
+    ///
+    /// The client always offers the latest initialize-lifecycle version. A
+    /// server that only implements `2024-11-05` answers with that version
+    /// instead, and by default [`McpClient::initialize`] rejects it because
+    /// it is not in
+    /// [`SUPPORTED_PROTOCOL_VERSIONS`](crate::protocol::SUPPORTED_PROTOCOL_VERSIONS).
+    /// Many deployed stdio servers still answer this way. The later revisions
+    /// mainly add optional features and change the HTTP transport, so a
+    /// client that uses tools, resources and prompts keeps working against
+    /// such a server.
+    ///
+    /// Off by default. Turning it on does not change the version the client
+    /// offers and does not add `2024-11-05` to [`ProtocolSupport`]; it only
+    /// stops `initialize` from failing when the server selects it.
+    pub fn accept_protocol_2024_11_05(mut self, accept: bool) -> Self {
+        self.accept_protocol_2024_11_05 = accept;
+        self
+    }
+
     /// Bound the number of MRTR rounds automatically followed for one request.
     ///
     /// Zero is normalized to one. The default is eight rounds.
@@ -675,6 +702,7 @@ impl McpClientBuilder {
                 capabilities: self.capabilities,
                 roots: self.roots,
                 protocol_support: self.protocol_support,
+                accept_protocol_2024_11_05: self.accept_protocol_2024_11_05,
                 max_mrtr_rounds: self.max_mrtr_rounds,
                 cache_config: self.cache_config,
                 request_progress: self.request_progress,
@@ -733,6 +761,7 @@ impl McpClient {
             capabilities,
             roots,
             protocol_support,
+            accept_protocol_2024_11_05,
             max_mrtr_rounds,
             cache_config,
             request_progress,
@@ -770,6 +799,7 @@ impl McpClient {
             server_info: RwLock::new(None),
             capabilities,
             protocol_support,
+            accept_protocol_2024_11_05: AtomicBool::new(accept_protocol_2024_11_05),
             selected_protocol_version: RwLock::new(None),
             client_info: RwLock::new(None),
             discovery: RwLock::new(None),
@@ -804,6 +834,21 @@ impl McpClient {
     /// Return the exact ordered protocol implementations enabled for this client.
     pub fn protocol_support(&self) -> &ProtocolSupport {
         &self.protocol_support
+    }
+
+    /// Whether `initialize` accepts a server that selects `2024-11-05`.
+    ///
+    /// See [`McpClientBuilder::accept_protocol_2024_11_05`].
+    pub fn accepts_protocol_2024_11_05(&self) -> bool {
+        self.accept_protocol_2024_11_05.load(Ordering::Acquire)
+    }
+
+    /// Turn on acceptance of `2024-11-05` for a client the proxy did not
+    /// build itself. Takes effect at the next `initialize`.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn set_accept_protocol_2024_11_05(&self, accept: bool) {
+        self.accept_protocol_2024_11_05
+            .store(accept, Ordering::Release);
     }
 
     /// Clear every cached final-protocol response held by this client.
@@ -906,13 +951,28 @@ impl McpClient {
         // must not be treated as a successful handshake: nothing downstream
         // re-checks it, so an unvalidated version here silently drives every
         // later request with mismatched semantics.
-        if !crate::protocol::SUPPORTED_PROTOCOL_VERSIONS.contains(&result.protocol_version.as_str())
-            || !self.protocol_support.contains(&result.protocol_version)
+        //
+        // A server that only implements 2024-11-05 answers with it. That is
+        // accepted only when the caller opted in.
+        const PROTOCOL_VERSION_2024_11_05: &str = "2024-11-05";
+        let is_2024_11_05 = result.protocol_version == PROTOCOL_VERSION_2024_11_05;
+        let accepted_2024_11_05 =
+            is_2024_11_05 && self.accept_protocol_2024_11_05.load(Ordering::Acquire);
+        if !accepted_2024_11_05
+            && (!crate::protocol::SUPPORTED_PROTOCOL_VERSIONS
+                .contains(&result.protocol_version.as_str())
+                || !self.protocol_support.contains(&result.protocol_version))
         {
+            let hint = if is_2024_11_05 {
+                "; enable McpClientBuilder::accept_protocol_2024_11_05 to accept it"
+            } else {
+                ""
+            };
             return Err(Error::Transport(format!(
-                "server selected protocol version `{}`, which is not an initialize-lifecycle version this client supports; client supports: {:?}",
+                "server selected protocol version `{}`, which is not an initialize-lifecycle version this client supports; client supports: {:?}{}",
                 result.protocol_version,
-                self.protocol_support.versions()
+                self.protocol_support.versions(),
+                hint
             )));
         }
 

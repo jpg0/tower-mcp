@@ -322,6 +322,91 @@ async fn initialize_rejects_an_unknown_version() {
     assert!(!client.is_initialized());
 }
 
+/// Many deployed stdio servers only implement 2024-11-05 and answer the
+/// latest offer with it. Without the opt-in that stays a handshake failure,
+/// and the error names the switch so the caller can find it.
+#[tokio::test]
+async fn initialize_rejects_2024_11_05_by_default() {
+    let transport =
+        MockTransport::with_responses(vec![mock_initialize_response_with_version("2024-11-05")]);
+    let client = McpClient::connect(transport).await.unwrap();
+    assert!(!client.accepts_protocol_2024_11_05());
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.initialize("test-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize must not hang")
+    .expect_err("2024-11-05 must not complete initialize unless the caller opted in");
+
+    let message = error.to_string();
+    assert!(message.contains("2024-11-05"), "got: {message}");
+    assert!(
+        message.contains("accept_protocol_2024_11_05"),
+        "the error should name the opt-in, got: {message}"
+    );
+    assert!(!client.is_initialized());
+}
+
+/// With the opt-in, the same answer completes the handshake. The client still
+/// offers the latest version: the switch widens what it accepts, not what it
+/// asks for.
+#[tokio::test]
+async fn initialize_accepts_2024_11_05_when_opted_in() {
+    let transport =
+        MockTransport::with_responses(vec![mock_initialize_response_with_version("2024-11-05")]);
+    let outgoing = transport.outgoing.clone();
+    let client = McpClient::builder()
+        .accept_protocol_2024_11_05(true)
+        .connect_simple(transport)
+        .await
+        .unwrap();
+    assert!(client.accepts_protocol_2024_11_05());
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.initialize("test-client", "1.0.0"),
+    )
+    .await
+    .expect("initialize must not hang")
+    .expect("an opted-in client must accept a server-selected 2024-11-05");
+
+    assert_eq!(result.protocol_version, "2024-11-05");
+    assert!(client.is_initialized());
+    let first: serde_json::Value = serde_json::from_str(&outgoing.lock().unwrap()[0]).unwrap();
+    assert_eq!(first["method"], "initialize");
+    assert_eq!(
+        first["params"]["protocolVersion"],
+        crate::protocol::LATEST_PROTOCOL_VERSION
+    );
+}
+
+/// The opt-in covers exactly 2024-11-05. Unknown versions and the
+/// discover-lifecycle version are still rejected.
+#[tokio::test]
+async fn opting_into_2024_11_05_still_rejects_other_versions() {
+    for version in ["1999-01-01", "2026-07-28"] {
+        let transport =
+            MockTransport::with_responses(vec![mock_initialize_response_with_version(version)]);
+        let client = McpClient::builder()
+            .accept_protocol_2024_11_05(true)
+            .connect_simple(transport)
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.initialize("test-client", "1.0.0"),
+        )
+        .await
+        .expect("initialize must not hang")
+        .expect_err("the 2024-11-05 opt-in must not widen acceptance to other versions");
+        assert!(error.to_string().contains(version), "got: {error}");
+        assert!(!client.is_initialized());
+    }
+}
+
 #[cfg(any(feature = "protocol-2026-07-28", feature = "stateless"))]
 #[tokio::test]
 async fn final_discover_injects_metadata_on_every_request() {
