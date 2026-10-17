@@ -2849,7 +2849,7 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                         };
 
                         tracing::debug!(method = %method, id = ?id, "Sending request");
-                        pending_requests.insert(id, PendingRequest {
+                        pending_requests.insert(id.clone(), PendingRequest {
                             method,
                             response_tx,
                             acknowledgment_tx: None,
@@ -2857,26 +2857,13 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
 
                         if let Err(e) = transport.send(&json).await {
                             tracing::error!(error = %e, "Transport send error");
-                            // Attempt reconnection before failing pending requests
-                            match transport.reconnect().await {
-                                Ok(true) => {
-                                    tracing::info!("Reconnection succeeded, retrying request");
-                                    // Retry the send
-                                    if let Err(e) = transport.send(&json).await {
-                                        tracing::error!(error = %e, "Transport send error after reconnect");
-                                        fail_all_pending(&mut pending_requests, &format!("Transport error after reconnect: {}", e));
-                                        break;
-                                    }
-                                    // Send succeeded after reconnect, continue
+                            match recover_failed_send(&mut transport, &json, &e).await {
+                                SendRecovery::Sent => {}
+                                SendRecovery::RetryFailed(reason) => {
+                                    fail_pending_request(&mut pending_requests, &id, &reason);
                                 }
-                                Ok(false) => {
-                                    tracing::warn!("Reconnection not supported or not attempted");
-                                    fail_all_pending(&mut pending_requests, &format!("Transport error: {}", e));
-                                    break;
-                                }
-                                Err(reconnect_err) => {
-                                    tracing::error!(error = %reconnect_err, "Reconnection failed");
-                                    fail_all_pending(&mut pending_requests, &format!("Transport error: {}, reconnect failed: {}", e, reconnect_err));
+                                SendRecovery::Fatal(reason) => {
+                                    fail_all_pending(&mut pending_requests, &reason);
                                     break;
                                 }
                             }
@@ -2907,39 +2894,17 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                             response_tx,
                             acknowledgment_tx: Some(acknowledgment_tx),
                         });
-                        let _ = id_tx.send(id);
+                        let _ = id_tx.send(id.clone());
 
                         if let Err(error) = transport.send(&json).await {
                             tracing::error!(%error, "Subscription transport send error");
-                            // Attempt reconnection before failing pending requests
-                            match transport.reconnect().await {
-                                Ok(true) => {
-                                    tracing::info!("Reconnection succeeded, retrying subscription");
-                                    // Retry the send
-                                    if let Err(error) = transport.send(&json).await {
-                                        tracing::error!(%error, "Subscription transport send error after reconnect");
-                                        fail_all_pending(
-                                            &mut pending_requests,
-                                            &format!("Transport error after reconnect: {error}"),
-                                        );
-                                        break;
-                                    }
-                                    // Send succeeded after reconnect, continue
+                            match recover_failed_send(&mut transport, &json, &error).await {
+                                SendRecovery::Sent => {}
+                                SendRecovery::RetryFailed(reason) => {
+                                    fail_pending_request(&mut pending_requests, &id, &reason);
                                 }
-                                Ok(false) => {
-                                    tracing::warn!("Reconnection not supported or not attempted");
-                                    fail_all_pending(
-                                        &mut pending_requests,
-                                        &format!("Transport error: {error}"),
-                                    );
-                                    break;
-                                }
-                                Err(reconnect_err) => {
-                                    tracing::error!(error = %reconnect_err, "Reconnection failed");
-                                    fail_all_pending(
-                                        &mut pending_requests,
-                                        &format!("Transport error: {error}, reconnect failed: {reconnect_err}"),
-                                    );
+                                SendRecovery::Fatal(reason) => {
+                                    fail_all_pending(&mut pending_requests, &reason);
                                     break;
                                 }
                             }
@@ -3084,8 +3049,18 @@ async fn message_loop<T: ClientTransport, H: ClientHandler>(
                     && let Err(e) = transport.send(&json).await
                 {
                     tracing::error!(error = %e, "Transport send error");
-                    fail_all_pending(&mut pending_requests, &format!("Transport error: {}", e));
-                    break;
+                    match recover_failed_send(&mut transport, &json, &e).await {
+                        SendRecovery::Sent => {}
+                        // The reply to a server-initiated request has no
+                        // caller to notify; dropping it is all that is left.
+                        SendRecovery::RetryFailed(reason) => {
+                            tracing::warn!(%reason, "Dropping reply to server request");
+                        }
+                        SendRecovery::Fatal(reason) => {
+                            fail_all_pending(&mut pending_requests, &reason);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -3720,6 +3695,84 @@ fn parse_server_notification(
 }
 
 /// Fail all pending requests with the given error message.
+/// What the message loop does after a send failed and a reconnect was tried.
+enum SendRecovery {
+    /// The message went out, on the retry.
+    Sent,
+    /// The transport was reset and is usable, but the retry failed too, for
+    /// example because the server is still down. Only the message being sent
+    /// fails; the loop keeps running so that a later request can succeed
+    /// once the server is back.
+    RetryFailed(String),
+    /// The transport is gone: fail everything and stop the loop.
+    Fatal(String),
+}
+
+/// Recover from a failed `send` of `json`: reset the transport, then send
+/// once more.
+///
+/// A transport that reports `Ok(true)` from `reconnect()` has been reset and
+/// is ready, so a failed retry is that message's own error and not the end
+/// of the connection. One that reports `Ok(false)` (not supported or not
+/// attempted) gets a single retry if it still says it is connected, and the
+/// loop stops if that fails too.
+async fn recover_failed_send<T: ClientTransport>(
+    transport: &mut T,
+    json: &str,
+    error: &Error,
+) -> SendRecovery {
+    match transport.reconnect().await {
+        Ok(true) => {
+            tracing::info!("Reconnection succeeded, retrying send");
+            match transport.send(json).await {
+                Ok(()) => SendRecovery::Sent,
+                Err(retry_error) => {
+                    tracing::error!(error = %retry_error, "Transport send error after reconnect");
+                    let reason = format!("Transport error after reconnect: {retry_error}");
+                    if transport.is_connected() {
+                        SendRecovery::RetryFailed(reason)
+                    } else {
+                        SendRecovery::Fatal(reason)
+                    }
+                }
+            }
+        }
+        Ok(false) if transport.is_connected() => {
+            tracing::info!("Reconnection not supported, retrying send once");
+            match transport.send(json).await {
+                Ok(()) => SendRecovery::Sent,
+                Err(retry_error) => {
+                    tracing::error!(error = %retry_error, "Transport send error on retry");
+                    SendRecovery::Fatal(format!("Transport error: {retry_error}"))
+                }
+            }
+        }
+        Ok(false) => {
+            tracing::warn!("Reconnection not supported or not attempted");
+            SendRecovery::Fatal(format!("Transport error: {error}"))
+        }
+        Err(reconnect_err) => {
+            tracing::error!(error = %reconnect_err, "Reconnection failed");
+            SendRecovery::Fatal(format!(
+                "Transport error: {error}, reconnect failed: {reconnect_err}"
+            ))
+        }
+    }
+}
+
+/// Fail one pending request, leaving the others alone.
+fn fail_pending_request(
+    pending: &mut HashMap<RequestId, PendingRequest>,
+    id: &RequestId,
+    reason: &str,
+) {
+    if let Some(req) = pending.remove(id) {
+        let _ = req
+            .response_tx
+            .send(Err(Error::Transport(reason.to_string())));
+    }
+}
+
 fn fail_all_pending(pending: &mut HashMap<RequestId, PendingRequest>, reason: &str) {
     for (_, req) in pending.drain() {
         let _ = req

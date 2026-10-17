@@ -902,8 +902,11 @@ impl HttpClientTransport {
     /// stream (if a session exists), and drains stale channel messages. Useful when the proxy layer needs to explicitly reconnect
     /// after detecting that the transport is dead but may recover.
     ///
-    /// Returns `Ok(true)` if reconnection succeeded (SSE stream restarted
-    /// or no session to resume). Returns `Err` if SSE restart failed.
+    /// Returns `Ok(true)` once the transport is reset and ready to send
+    /// again: either the SSE stream was restarted, or there was no session
+    /// to resume (a stateless server, or `auto_sse` off), in which case the
+    /// reset above is the whole recovery. Never `Ok(false)`: the reset
+    /// itself cannot fail.
     pub async fn reconnect(&mut self) -> Result<bool> {
         tracing::info!(url = %self.url, "Resetting HTTP transport for reconnect");
 
@@ -933,10 +936,9 @@ impl HttpClientTransport {
         // If we have a session, restart the SSE stream
         if self.session_id.is_some() && self.config.auto_sse {
             self.start_sse_stream();
-            return Ok(true);
         }
 
-        Ok(false)
+        Ok(true)
     }
 }
 

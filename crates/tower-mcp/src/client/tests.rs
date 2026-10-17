@@ -2387,3 +2387,137 @@ async fn test_response_with_both_result_and_error_fails_as_malformed() {
         other => panic!("expected Error::Transport, got: {other:?}"),
     }
 }
+
+/// Wraps [`MockTransport`] so a chosen number of `send` calls fail and
+/// `reconnect` answers with a fixed value, to exercise the message loop's
+/// send-failure recovery.
+struct FlakySendTransport {
+    inner: MockTransport,
+    /// Sends that still fail before the wrapped transport sees one.
+    failures_left: Arc<std::sync::atomic::AtomicUsize>,
+    /// What `reconnect()` answers.
+    reconnect_reply: bool,
+    reconnects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FlakySendTransport {
+    fn new(inner: MockTransport, reconnect_reply: bool) -> Self {
+        Self {
+            inner,
+            failures_left: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reconnect_reply,
+            reconnects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl ClientTransport for FlakySendTransport {
+    async fn send(&mut self, message: &str) -> Result<()> {
+        let failed = self
+            .failures_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if failed {
+            return Err(Error::Transport("flaky send".to_string()));
+        }
+        self.inner.send(message).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<String>> {
+        self.inner.recv().await
+    }
+
+    fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.inner.close().await
+    }
+
+    async fn reconnect(&mut self) -> Result<bool> {
+        self.reconnects.fetch_add(1, Ordering::SeqCst);
+        Ok(self.reconnect_reply)
+    }
+}
+
+fn tool_result(text: &str) -> serde_json::Value {
+    serde_json::json!({ "content": [{ "type": "text", "text": text }] })
+}
+
+/// A transport that cannot reconnect (`Ok(false)`) but is still connected
+/// gets one retry of the failed send.
+#[tokio::test]
+async fn failed_send_is_retried_once_when_reconnect_is_unsupported() {
+    let transport = FlakySendTransport::new(
+        MockTransport::with_responses(vec![mock_initialize_response(), tool_result("ok")]),
+        false,
+    );
+    let failures = transport.failures_left.clone();
+    let reconnects = transport.reconnects.clone();
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    failures.store(1, Ordering::SeqCst);
+    client
+        .call_tool("t", serde_json::json!({}))
+        .await
+        .expect("the retry must deliver the request");
+    assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+    assert!(client.is_connected());
+}
+
+/// If that one retry fails as well, the loop still stops, as before.
+#[tokio::test]
+async fn failed_retry_without_reconnect_support_closes_the_client() {
+    let transport = FlakySendTransport::new(
+        MockTransport::with_responses(vec![mock_initialize_response(), tool_result("ok")]),
+        false,
+    );
+    let failures = transport.failures_left.clone();
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    failures.store(2, Ordering::SeqCst);
+    let error = client
+        .call_tool("t", serde_json::json!({}))
+        .await
+        .expect_err("both sends fail");
+    assert!(error.to_string().contains("flaky send"), "got: {error}");
+
+    let error = client
+        .call_tool("t", serde_json::json!({}))
+        .await
+        .expect_err("the loop has stopped");
+    assert!(
+        error.to_string().contains("Connection closed"),
+        "got: {error}"
+    );
+}
+
+/// A transport that was reset (`Ok(true)`) is ready for the next request even
+/// when the retry of this one fails: only this request fails.
+#[tokio::test]
+async fn failed_retry_after_successful_reconnect_keeps_the_client_alive() {
+    let transport = FlakySendTransport::new(
+        MockTransport::with_responses(vec![mock_initialize_response(), tool_result("back")]),
+        true,
+    );
+    let failures = transport.failures_left.clone();
+    let client = McpClient::connect(transport).await.unwrap();
+    client.initialize("test-client", "1.0.0").await.unwrap();
+
+    failures.store(2, Ordering::SeqCst);
+    let error = client
+        .call_tool("t", serde_json::json!({}))
+        .await
+        .expect_err("both sends fail");
+    assert!(error.to_string().contains("flaky send"), "got: {error}");
+    assert!(client.is_connected());
+
+    client
+        .call_tool("t", serde_json::json!({}))
+        .await
+        .expect("the next request must succeed on the same client");
+}
